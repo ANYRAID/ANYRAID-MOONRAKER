@@ -53,6 +53,7 @@ if TYPE_CHECKING:
 
 _T = TypeVar("_T")
 ENDPOINT_PREFIXES = ["printer", "server", "machine", "access", "api", "debug"]
+SCREEN_START_INTENT = "anyraid_start_intent"
 
 class ExtendedFlag(Flag):
     @classmethod
@@ -713,6 +714,10 @@ class JsonRPC:
                 for field in ["access_token", "api_key"]:
                     if field in params:
                         output["params"][field] = "<sanitized>"
+            elif isinstance(params, dict) and SCREEN_START_INTENT in params:
+                output = {
+                    **rpc_obj, "params": {**params, SCREEN_START_INTENT: "<sanitized>"}
+                }
         logging.debug(f"{trtype} Received::{jsonw.dumps(output).decode()}")
 
     def _log_response(

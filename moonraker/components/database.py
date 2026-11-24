@@ -20,6 +20,7 @@ import sqlite3
 from ..utils import Sentinel, ServerError
 from ..utils import json_wrapper as jsonw
 from ..common import RequestType, SqlTableDefinition
+from .history_generation import GenerationUnavailable, HistoryDatabaseGeneration
 
 # Annotation imports
 from typing import (
@@ -462,6 +463,18 @@ class MoonrakerDatabase:
     ) -> Future[Any]:
         return self.db_provider.execute_db_function(callback)
 
+    def enable_history_generation(self) -> None:
+        provider = self.db_provider
+        provider.history_generation.initialize(provider.sync_conn)
+
+    def require_history_generation(self, conn: sqlite3.Connection) -> str:
+        try:
+            return self.db_provider.history_generation.require(conn)
+        except GenerationUnavailable as exc:
+            raise self.server.error(
+                "History database generation is unavailable", 503
+            ) from exc
+
     def compact_database(self) -> Future[Dict[str, int]]:
         return self.db_provider.execute_db_function(
             self.db_provider.compact_database
@@ -743,6 +756,7 @@ class SqliteProvider(Thread):
         self._namespaces: Set[str] = set()
         self._tables: Set[str] = set()
         self._db_path = db_path
+        self.history_generation = HistoryDatabaseGeneration(db_path)
         self.restored: bool = False
         self.command_queue: Queue[Tuple[Future, Optional[Callable], Tuple[Any, ...]]]
         self.command_queue = Queue()
@@ -754,8 +768,11 @@ class SqliteProvider(Thread):
         self.sync_conn = sqlite3.connect(
             str(db_path), timeout=1., detect_types=sqlite3.PARSE_DECLTYPES
         )
+        self.history_generation.observe_database_path()
         self.sync_conn.row_factory = sqlite3.Row
         self.setup_database()
+        if self.history_generation.anchor_path.exists():
+            self.history_generation.initialize(self.sync_conn)
 
     @property
     def namespaces(self) -> Set[str]:
@@ -789,6 +806,7 @@ class SqliteProvider(Thread):
             else:
                 loop.call_soon_threadsafe(future.set_result, ret)
         conn.close()
+        self.history_generation.close()
         loop.call_soon_threadsafe(future.set_result, None)
 
     def execute_db_function(
@@ -1356,10 +1374,15 @@ class SqliteProvider(Thread):
             raise self.server.error("Database already restored")
         if not restore_path.is_file():
             raise self.server.error(f"Restoration File {restore_path} does not exist")
-        restore_conn = sqlite3.connect(str(restore_path))
-        restore_info = self._validate_restore_db(restore_conn)
-        restore_conn.backup(conn)
-        restore_conn.close()
+        with contextlib.closing(sqlite3.connect(str(restore_path))) as restore_conn:
+            restore_info = self._validate_restore_db(restore_conn)
+            try:
+                self.history_generation.before_restore(conn, restore_conn)
+            except GenerationUnavailable as exc:
+                raise self.server.error(
+                    "Could not revoke history database generation", 503
+                ) from exc
+            restore_conn.backup(conn)
         self.restored = True
         return restore_info
 
@@ -1372,7 +1395,6 @@ class SqliteProvider(Thread):
         cursor.arraysize = 100
         tables = [row[0] for row in cursor.fetchall()]
         if NAMESPACE_TABLE not in tables:
-            restore_conn.close()
             raise self.server.error(
                 f"Invalid database for restoration, missing table '{NAMESPACE_TABLE}'"
             )
@@ -1401,6 +1423,7 @@ class SqliteProvider(Thread):
     def stop(self) -> Future[None]:
         fut = self.asyncio_loop.create_future()
         if not self.is_alive():
+            self.history_generation.close()
             fut.set_result(None)
         else:
             self.command_queue.put_nowait((fut, None, tuple()))

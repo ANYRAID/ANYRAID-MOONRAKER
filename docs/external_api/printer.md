@@ -614,6 +614,22 @@ POST /printer/print/start?filename=test_print.gcode
 "ok"
 ```
 
+When [signed SCREEN history association](history.md#signed-screen-history-association)
+has a dispatch key configured, the same start API also accepts a JSON body
+whose sole field is `anyraid_start_intent`. Its value is the signed launch
+intent. Supply the relative filename inside the envelope only and omit the
+`filename` query or body argument. JSON-RPC callers use the same single field
+in `params`. The existing print start authorization applies.
+
+Moonraker forwards the verified envelope through the existing Klippy
+`gcode/script` request using the reserved `anyraid_start_intent` parameter.
+The request carries no `script` argument. A Klippy host without SCREEN intent
+support rejects it, and Moonraker propagates the error without retrying.
+Submitting the reserved parameter to the public `printer.gcode.script` API
+is rejected. The start API returns `"ok"` when Klippy accepts the request.
+The issuer's separate status notification and history proof confirm the
+started file and history association.
+
 ### Pause a print job
 ```{.http .apirequest title="HTTP Request"}
 POST /printer/print/pause

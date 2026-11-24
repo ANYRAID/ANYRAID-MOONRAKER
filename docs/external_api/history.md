@@ -450,3 +450,66 @@ If `all = true` is specified the `uid` parameter should be omitted.
 |                |          | job entries that were deleted.        |^
 
 ///
+
+### Signed SCREEN history association
+
+The optional `[history screen_association]` section enables a read-only proof
+endpoint. Set `origin` to the canonical loopback HTTP origin including its
+explicit, non-default port. Set `issuer_public_key` to the trusted launch
+issuer's 32-byte Ed25519 public key in lowercase hex. Set `signing_key_path` to
+an absolute path to a separate, owner-only regular file containing the proof
+signer's 32-byte seed in lowercase hex. Provision the corresponding proof
+public key independently in the reader.
+
+To enable SCREEN's signed start variant of [the print start API](printer.md#start-a-print-job),
+set the optional `dispatch_public_key` to the SCREEN dispatch signer's raw
+32-byte Ed25519 public key in lowercase hex. The dispatch, issuer and proof
+keys must be separate. Provision the same dispatch public key at the Klippy
+host and the matching issuer public key here. Existing proof-only installations
+can leave this option unset.
+
+The signed launch intent has the same eight fields as the receipt below,
+followed by `expiresAt` as an integer Unix timestamp in seconds. It must be
+in the future and at most 300 seconds ahead of the verifier's clock. Sign
+the domain `screen-history-start-intent-v1` followed by a NUL byte and a
+compact JSON array of those nine field values in that order. Use UTF-8 for
+non-ASCII text and add the unpadded base64url Ed25519 signature as
+`signature`. Moonraker verifies the signed intent against the configured
+origin, proof authority and live database generation before forwarding it.
+
+The launch issuer must attest the actual start in the same Klippy
+`print_stats` update that transitions to printing. The optional
+`anyraid_start_receipt` object uses the following signing order.
+
+```text
+origin, databaseGeneration, backendEpoch, taskId, startId, authorityKeyId, filename, fileSha256
+```
+
+Sign the UTF-8 bytes of the domain `screen-history-start-receipt-v1`, a NUL byte,
+and the compact JSON array of field values in that order. Encode non-ASCII text directly in UTF-8. Add the unpadded
+base64url Ed25519 signature as `signature`. The authority ID is the lowercase
+SHA-256 hex digest of the proof public key in DER SubjectPublicKeyInfo format.
+The digest of the started file is attested by the launch issuer. Stock Klippy
+does not supply this receipt. Ordinary jobs continue to appear in history.
+
+`GET /server/history/association` returns the configured origin, current
+`databaseGeneration` and `authorityKeyId`. History list and individual job
+responses add `rowId` and `databaseGeneration` only for a currently bound row.
+To challenge it, POST the origin, canonical history `jobId`, `rowId`,
+`databaseGeneration` and fresh `challenge` (32 random bytes in lowercase hex)
+to the same endpoint. The signed response adds `backendEpoch`, `taskId` and
+`startId`. The proof domain is `screen-isolated-history-binding-v1` followed
+by NUL and the compact JSON array of origin, jobId, challenge,
+databaseGeneration, rowId, backendEpoch, taskId and startId, in that order.
+A reader must verify the challenge, row, pinned key and original start intent.
+
+The SQLite history row and its binding commit together. A deleted job's
+consumed start cannot bind a second row. A managed database restore revokes
+the old generation before copying. Replacing the database file also breaks
+continuity. The writer keeps a sibling hard link to the database so the filesystem
+cannot recycle its identity after deletion. A displaced database may occupy disk
+space until the writer establishes the replacement generation. Filesystem hard-link
+support is required for this optional feature. The generation anchor and database must remain under
+trusted local storage administration. Rolling back the whole host, or rewriting
+the live file in place outside Moonraker while preserving all identity
+markers, requires independent revocation of trust before the reader reconnects.

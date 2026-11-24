@@ -14,7 +14,8 @@ import asyncio
 import pathlib
 from ..utils import ServerError, get_unix_peer_credentials
 from ..utils import json_wrapper as jsonw
-from ..common import KlippyState, RequestType
+from ..common import KlippyState, RequestType, SCREEN_START_INTENT
+from .history_association import RECEIPT_FIELD
 
 # Annotation imports
 from typing import (
@@ -610,10 +611,16 @@ class KlippyConnection:
             return await self._request_subscripton(web_request)
         else:
             if rpc_method == "gcode/script":
-                script = web_request.get_str('script', "")
-                if script:
-                    self.server.send_event(
-                        "klippy_connection:gcode_received", script)
+                if SCREEN_START_INTENT in web_request.get_args():
+                    if web_request.get_subscribable() is not self.klippy_apis:
+                        raise ServerError(
+                            "Screen intent requires the print start API", 403
+                        )
+                else:
+                    script = web_request.get_str('script', "")
+                    if script:
+                        self.server.send_event(
+                            "klippy_connection:gcode_received", script)
             return await self._request_standard(web_request)
 
     async def _request_subscripton(self, web_request: WebRequest) -> Dict[str, Any]:
@@ -654,6 +661,10 @@ class KlippyConnection:
                 if obj in self.subscription_cache:
                     cached_status = self.subscription_cache[obj]
                     for field_name, value in fields.items():
+                        if obj == "print_stats" and field_name == RECEIPT_FIELD:
+                            # A snapshot returned by a subscription request is
+                            # not evidence from a fresh Klippy notification.
+                            continue
                         if field_name not in cached_status:
                             continue
                         if value != cached_status[field_name]:

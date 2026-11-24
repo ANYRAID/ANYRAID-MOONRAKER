@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 import logging
+from .history_association import RECEIPT_FIELD
 
 # Annotation imports
 from typing import (
@@ -49,7 +50,8 @@ class JobState:
         except self.server.error:
             logging.info("Error subscribing to print_stats")
             return
-        self.last_print_stats = result.get("print_stats", {})
+        self.last_print_stats = dict(result.get("print_stats", {}))
+        self.last_print_stats.pop(RECEIPT_FIELD, None)
         if "state" in self.last_print_stats:
             state = self.last_print_stats["state"]
             logging.info(f"Job state initialized: {state}")
@@ -57,7 +59,10 @@ class JobState:
     async def _status_update(self, data: Dict[str, Any], _: float) -> None:
         if 'print_stats' not in data:
             return
-        ps = data['print_stats']
+        ps = dict(data['print_stats'])
+        # This is per-notification evidence. Never copy it to cached stats,
+        # recovered subscriptions, resumes or inferred starts.
+        start_receipt = ps.pop(RECEIPT_FIELD, None)
         if "state" in ps:
             prev_ps = dict(self.last_print_stats)
             old_state: str = prev_ps['state']
@@ -86,6 +91,8 @@ class JobState:
                     f"Job State Changed - Prev State: {old_state}, "
                     f"New State: {new_state}"
                 )
+                if new_state == "started" and start_receipt is not None:
+                    new_ps[RECEIPT_FIELD] = start_receipt
                 self._send_job_event(new_state, prev_ps, new_ps)
         if "info" in ps:
             cur_layer: Optional[int] = ps["info"].get("current_layer")

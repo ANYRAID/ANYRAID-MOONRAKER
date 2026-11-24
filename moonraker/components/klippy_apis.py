@@ -7,7 +7,7 @@
 from __future__ import annotations
 import logging
 from ..utils import Sentinel
-from ..common import WebRequest, APITransport, RequestType
+from ..common import WebRequest, APITransport, RequestType, SCREEN_START_INTENT
 
 # Annotation imports
 from typing import (
@@ -25,6 +25,7 @@ from typing import (
 if TYPE_CHECKING:
     from ..confighelper import ConfigHelper
     from ..common import UserInfo
+    from .history import History
     from .klippy_connection import KlippyConnection as Klippy
     Subscription = Dict[str, Optional[List[Any]]]
     SubCallback = Callable[[Dict[str, Dict[str, Any]], float], Optional[Coroutine]]
@@ -89,9 +90,26 @@ class KlippyAPI(APITransport):
         return await self.cancel_print()
 
     async def _gcode_start_print(self, web_request: WebRequest) -> str:
-        filename: str = web_request.get_str('filename')
         user = web_request.get_current_user()
-        return await self.start_print(filename, user=user)
+        args = web_request.get_args()
+        if SCREEN_START_INTENT not in args:
+            return await self.start_print(web_request.get_str("filename"), user=user)
+        if args.keys() != {SCREEN_START_INTENT}:
+            raise self.server.error("Invalid screen print start parameters", 400)
+        history: History = self.server.lookup_component("history")
+        if history.association is None:
+            raise self.server.error("Screen print dispatch unavailable", 503)
+        intent = await history.association.authenticate_dispatch(
+            args[SCREEN_START_INTENT]
+        )
+        logging.info("Requesting signed Screen Job Start")
+        result = await self._send_klippy_request(
+            GCODE_ENDPOINT, {SCREEN_START_INTENT: intent}
+        )
+        if result != "ok":
+            raise self.server.error("Unconfirmed screen print dispatch", 502)
+        self.server.send_event("klippy_apis:job_start_complete", user)
+        return result
 
     async def _gcode_restart(self, web_request: WebRequest) -> str:
         return await self.do_restart("RESTART")

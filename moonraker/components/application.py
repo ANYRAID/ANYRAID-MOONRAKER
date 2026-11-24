@@ -37,7 +37,8 @@ from ..common import (
     APITransport,
     TransportType,
     RequestType,
-    KlippyState
+    KlippyState,
+    SCREEN_START_INTENT
 )
 from ..utils import json_wrapper as jsonw
 from streaming_form_data import StreamingFormDataParser, ParseFailedException
@@ -688,6 +689,8 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
                     endpoint.startswith("/machine/sudo/password")
                 ):
                     resp = {key: "<sanitized>" for key in args}
+                elif SCREEN_START_INTENT in args:
+                    resp = {**args, SCREEN_START_INTENT: "<sanitized>"}
             elif isinstance(args, str):
                 if args.startswith("<html>"):
                     resp = "<html>"
