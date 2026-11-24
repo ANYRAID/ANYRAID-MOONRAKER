@@ -498,6 +498,73 @@ class ScreenHistoryAssociationTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ServerError):
                 await moon.proof(generation, bound)
 
+    async def test_deleted_database_file_cannot_reuse_identity_from_backup(self):
+        backup = self.directory / "backup.sqlite"
+        async with self.instance() as moon:
+            generation = await moon.generation()
+            await moon.start(self.receipt(generation))
+            await moon.complete()
+            (bound,) = await moon.rows()
+            path = moon.database.database_path
+            pin = moon.database.db_provider.history_generation.pin_path
+            self.assertTrue(pin.samefile(path))
+            await moon.database.backup_database(backup)
+
+        identity = pin.stat().st_ino
+        path.unlink()
+        self.assertFalse(path.exists())
+        self.assertEqual(pin.stat().st_ino, identity)
+        shutil.copyfile(backup, path)
+        self.assertFalse(pin.samefile(path))
+
+        async with self.instance() as moon:
+            self.assertNotEqual(await moon.generation(), generation)
+            self.assertTrue(pin.samefile(path))
+            (copied,) = await moon.rows()
+            self.assertEqual(copied["job_id"], bound["job_id"])
+            self.assert_unbound(copied)
+            with self.assertRaises(ServerError):
+                await moon.proof(generation, bound)
+
+    async def test_missing_or_replaced_pin_disables_association_after_reopen(self):
+        for case in ("missing-pin", "replaced-pin"):
+            with self.subTest(case=case):
+                directory = self.directory / case
+                async with self.instance(directory) as moon:
+                    generation = await moon.generation()
+                    await moon.start(self.receipt(generation))
+                    await moon.complete()
+                    (bound,) = await moon.rows()
+                    self.assert_proof_signature(await moon.proof(generation, bound))
+                    path = moon.database.database_path
+                    pin = moon.database.db_provider.history_generation.pin_path
+
+                pin.unlink()
+                if case == "replaced-pin":
+                    shutil.copyfile(path, pin)
+                    self.assertFalse(pin.samefile(path))
+
+                async with self.instance(directory) as moon:
+                    with self.assertRaises(ServerError) as describe_error:
+                        await moon.generation()
+                    self.assertEqual(describe_error.exception.status_code, 503)
+                    with self.assertRaises(ServerError) as proof_error:
+                        await moon.proof(generation, bound)
+                    self.assertEqual(proof_error.exception.status_code, 503)
+                    (original,) = await moon.rows()
+                    self.assertEqual(original["job_id"], bound["job_id"])
+                    self.assert_unbound(original)
+                    await moon.start()
+                    await moon.complete()
+                    ordinary, original = await moon.rows()
+                    self.assert_unbound(ordinary)
+                    self.assert_unbound(original)
+
+                async with self.instance(directory) as moon:
+                    with self.assertRaises(ServerError) as reopened_error:
+                        await moon.proof(generation, bound)
+                    self.assertEqual(reopened_error.exception.status_code, 503)
+
     async def test_restored_saved_rows_never_offer_old_binding(self):
         backup = self.directory / "backup.sqlite"
         async with self.instance() as moon:

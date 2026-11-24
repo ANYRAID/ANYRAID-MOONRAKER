@@ -92,7 +92,9 @@ def _read_signing_seed(path: pathlib.Path) -> bytes:
             or info.st_mode & 0o077 or info.st_nlink != 1
         ):
             raise ValueError("Expected a private signing key")
-        seed = key_file.read(67).decode("ascii").removesuffix("\n")
+        seed = key_file.read(67).decode("ascii")
+        if seed.endswith("\n"):
+            seed = seed[:-1]
     if not _matches(_HEX32, seed):
         raise ValueError("Expected a 32-byte signing seed")
     return bytes.fromhex(seed)

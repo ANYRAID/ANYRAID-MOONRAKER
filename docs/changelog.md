@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog].
 
 ## [Unreleased]
 
+### Added
+
+- History can now bind a signed SCREEN start receipt to the job it created and
+  answer challenges for the current row. See the [configuration and protocol](external_api/history.md#signed-screen-history-association).
+
 ## [0.11.0] - 2026-08-25
 
 ### Changed

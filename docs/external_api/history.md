@@ -490,7 +490,10 @@ A reader must verify the challenge, row, pinned key and original start intent.
 The SQLite history row and its binding commit together. A deleted job's
 consumed start cannot bind a second row. A managed database restore revokes
 the old generation before copying. Replacing the database file also breaks
-continuity. The separate generation anchor and the database must remain under
+continuity. The writer keeps a sibling hard link to the database so the filesystem
+cannot recycle its identity after deletion. A displaced database may occupy disk
+space until the writer establishes the replacement generation. Filesystem hard-link
+support is required for this optional feature. The generation anchor and database must remain under
 trusted local storage administration. Rolling back the whole host, or rewriting
 the live file in place outside Moonraker while preserving all identity
 markers, requires independent revocation of trust before the reader reconnects.

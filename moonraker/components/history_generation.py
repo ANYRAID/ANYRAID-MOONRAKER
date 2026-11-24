@@ -5,8 +5,10 @@
 from __future__ import annotations
 import contextlib
 import logging
+import os
 import pathlib
 import sqlite3
+import stat
 import sys
 import uuid
 from typing import IO, Optional, Tuple
@@ -14,6 +16,7 @@ from typing import IO, Optional, Tuple
 
 _MARKER_TABLE = "anyraid_history_database_generation"
 _STATE_TABLE = "generation_state"
+_PINNED_ANCHOR_VERSION = 1
 _FileIdentity = Tuple[int, int]
 
 
@@ -28,6 +31,7 @@ class HistoryDatabaseGeneration:
         self.db_path = db_path.absolute()
         self.anchor_path = self.db_path.with_name(f"{db_path.name}.history-generation")
         self.lock_path = self.anchor_path.with_name(f"{self.anchor_path.name}.lock")
+        self.pin_path = self.anchor_path.with_name(f"{self.anchor_path.name}.pin")
         self._lock: Optional[IO[bytes]] = None
         self._identity: Optional[_FileIdentity] = None
         self._generation: Optional[str] = None
@@ -49,24 +53,28 @@ class HistoryDatabaseGeneration:
         self._acquire_owner()
         identity = self._require_open_path()
         if not self.anchor_path.exists() or self.anchor_path.stat().st_size == 0:
-            if self._read_marker(conn) is not None:
+            if self._read_marker(conn) is not None or self.pin_path.exists():
                 raise GenerationUnavailable(
                     "Database generation anchor is missing or empty"
                 )
             self._create_anchor(identity)
         with contextlib.closing(self._connect_anchor()) as anchor:
             generation, anchored_identity = self._read_anchor(anchor)
-            if generation is not None and anchored_identity == identity:
-                if self._read_marker(conn) != generation:
-                    raise GenerationUnavailable(
-                        "Database generation marker does not match"
-                    )
-                self._generation = generation
-                return
+            version = self._anchor_version(anchor)
+            if version == _PINNED_ANCHOR_VERSION and generation is not None:
+                if self._pin_identity() != anchored_identity:
+                    raise GenerationUnavailable("History database pin does not match")
+                if anchored_identity == identity:
+                    if self._read_marker(conn) != generation:
+                        raise GenerationUnavailable(
+                            "Database generation marker does not match"
+                        )
+                    self._generation = generation
+                    return
 
-            # A durable NULL prevents issuing old evidence following interruption.
-            with anchor:
-                self._write_anchor(anchor, None, identity)
+            # Older unpinned anchors also have to establish a fresh generation.
+            self._invalidate_anchor(anchor, identity)
+            self._pin_database(identity)
             generation = str(uuid.uuid4())
             with conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -79,7 +87,7 @@ class HistoryDatabaseGeneration:
                     f"INSERT OR REPLACE INTO {_MARKER_TABLE} VALUES (1, ?)",
                     (generation,)
                 )
-            if self._file_identity() != identity:
+            if self._pin_identity() != identity or self._file_identity() != identity:
                 raise GenerationUnavailable("History database changed while opening")
             with anchor:
                 self._write_anchor(anchor, generation, identity)
@@ -92,9 +100,12 @@ class HistoryDatabaseGeneration:
         try:
             with contextlib.closing(self._connect_anchor(read_only=True)) as anchor:
                 live_generation, identity = self._read_anchor(anchor)
+                version = self._anchor_version(anchor)
             if (
-                live_generation != generation or identity != self._identity
+                version != _PINNED_ANCHOR_VERSION
+                or live_generation != generation or identity != self._identity
                 or self._read_marker(conn) != generation
+                or self._pin_identity() != identity
                 or self._file_identity() != identity
             ):
                 raise GenerationUnavailable("History database generation changed")
@@ -110,20 +121,22 @@ class HistoryDatabaseGeneration:
     ) -> None:
         self._generation = None
         try:
-            self._acquire_owner()
-            identity = self._require_open_path()
             if (
-                not self.anchor_path.exists()
+                self._lock is None
+                and not self.anchor_path.exists()
+                and not self.pin_path.exists()
                 and self._read_marker(conn) is None
                 and self._read_marker(restore_conn) is None
+                and not self.lock_path.exists()
             ):
                 return
+            self._acquire_owner()
+            identity = self._require_open_path()
             if not self.anchor_path.exists():
                 self._create_anchor(identity)
             with contextlib.closing(self._connect_anchor()) as anchor:
                 self._read_anchor(anchor)
-                with anchor:
-                    self._write_anchor(anchor, None, identity)
+                self._invalidate_anchor(anchor, identity)
         except (OSError, sqlite3.Error) as exc:
             raise GenerationUnavailable(
                 "Could not revoke history database generation"
@@ -161,6 +174,28 @@ class HistoryDatabaseGeneration:
             )
         return stat.st_dev, stat.st_ino
 
+    def _pin_identity(self) -> _FileIdentity:
+        pin = self.pin_path.lstat()
+        if not stat.S_ISREG(pin.st_mode) or pin.st_ino == 0:
+            raise GenerationUnavailable("History database pin is not a regular file")
+        return pin.st_dev, pin.st_ino
+
+    def _pin_database(self, identity: _FileIdentity) -> None:
+        # This link holds the inode through an offline delete/copy. Never open
+        # SQLite using the link, which would use a different journal pathname.
+        # The anchor is already durably pending while replacing the old link.
+        with contextlib.suppress(FileNotFoundError):
+            self.pin_path.unlink()
+        os.link(self.db_path.resolve(strict=True), self.pin_path)
+        if self._pin_identity() != identity or self._file_identity() != identity:
+            raise GenerationUnavailable("History database changed while pinning")
+        if sys.platform != "win32":
+            directory = os.open(self.pin_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+
     def _require_open_path(self) -> _FileIdentity:
         identity = self._file_identity()
         if self._identity is not None and identity != self._identity:
@@ -191,6 +226,22 @@ class HistoryDatabaseGeneration:
                     "generation TEXT, device TEXT NOT NULL, inode TEXT NOT NULL)"
                 )
                 self._write_anchor(anchor, None, identity)
+                anchor.execute(f"PRAGMA user_version={_PINNED_ANCHOR_VERSION}")
+
+    def _anchor_version(self, anchor: sqlite3.Connection) -> int:
+        version = anchor.execute("PRAGMA user_version").fetchone()[0]
+        if version not in (0, _PINNED_ANCHOR_VERSION):
+            raise GenerationUnavailable("Unsupported history database anchor version")
+        return version
+
+    def _invalidate_anchor(
+        self, anchor: sqlite3.Connection, identity: _FileIdentity
+    ) -> None:
+        version = self._anchor_version(anchor)
+        with anchor:
+            self._write_anchor(anchor, None, identity)
+            if version != _PINNED_ANCHOR_VERSION:
+                anchor.execute(f"PRAGMA user_version={_PINNED_ANCHOR_VERSION}")
 
     def _read_anchor(
         self, anchor: sqlite3.Connection
