@@ -461,6 +461,22 @@ an absolute path to a separate, owner-only regular file containing the proof
 signer's 32-byte seed in lowercase hex. Provision the corresponding proof
 public key independently in the reader.
 
+To enable SCREEN's signed start variant of [the print start API](printer.md#start-a-print-job),
+set the optional `dispatch_public_key` to the SCREEN dispatch signer's raw
+32-byte Ed25519 public key in lowercase hex. The dispatch, issuer and proof
+keys must be separate. Provision the same dispatch public key at the Klippy
+host and the matching issuer public key here. Existing proof-only installations
+can leave this option unset.
+
+The signed launch intent has the same eight fields as the receipt below,
+followed by `expiresAt` as an integer Unix timestamp in seconds. It must be
+in the future and at most 300 seconds ahead of the verifier's clock. Sign
+the domain `screen-history-start-intent-v1` followed by a NUL byte and a
+compact JSON array of those nine field values in that order. Use UTF-8 for
+non-ASCII text and add the unpadded base64url Ed25519 signature as
+`signature`. Moonraker verifies the signed intent against the configured
+origin, proof authority and live database generation before forwarding it.
+
 The launch issuer must attest the actual start in the same Klippy
 `print_stats` update that transitions to printing. The optional
 `anyraid_start_receipt` object uses the following signing order.

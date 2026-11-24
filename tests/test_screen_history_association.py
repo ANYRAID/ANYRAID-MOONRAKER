@@ -11,6 +11,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import time
 import unittest
 import uuid
 from collections import defaultdict
@@ -20,11 +21,12 @@ from unittest.mock import AsyncMock, patch
 
 import libnacl
 
-from moonraker.common import APITransport, RequestType, WebRequest
+from moonraker.common import APITransport, RequestType, SCREEN_START_INTENT, WebRequest
 from moonraker.components.database import MoonrakerDatabase
 from moonraker.components.history import History
 from moonraker.components.history_association import HistoryAssociation
 from moonraker.components.job_state import JobState
+from moonraker.components.klippy_apis import KlippyAPI
 from moonraker.components.klippy_connection import KlippyConnection
 from moonraker.confighelper import ConfigHelper, DictSourceWrapper
 from moonraker.eventloop import EventLoop
@@ -36,9 +38,11 @@ FILENAME = "plate.gcode"
 HISTORY_LIST = "/server/history/list"
 HISTORY_JOB = "/server/history/job"
 PROOF = "/server/history/association"
+START = "/printer/print/start"
 RECEIPT_KEY = "anyraid_start_receipt"
 ISSUER_SEED = bytes.fromhex("12" * 32)
 PROOF_SEED = bytes.fromhex("34" * 32)
+DISPATCH_SEED = bytes.fromhex("56" * 32)
 ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
 
 
@@ -148,6 +152,10 @@ class OfflineMoonraker:
         self.server.components["job_state"] = self.job_state
         self.history = History(self.config)
         self.server.components["history"] = self.history
+        with patch.object(self.config, "getpath", return_value=directory / "unused.sock"):
+            self.klippy = KlippyConnection(self.config)
+        self.server.components["klippy_connection"] = self.klippy
+        self.server.components["klippy_apis"] = KlippyAPI(self.config)
         self.job_state.last_print_stats = {"state": "standby", "filename": ""}
 
     async def init(self):
@@ -196,6 +204,9 @@ class ScreenHistoryAssociationTest(unittest.IsolatedAsyncioTestCase):
             ISSUER_SEED
         )
         self.proof_public, _ = libnacl.crypto_sign_seed_keypair(PROOF_SEED)
+        self.dispatch_public, self.dispatch_secret = libnacl.crypto_sign_seed_keypair(
+            DISPATCH_SEED
+        )
         key_file = self.directory / "proof.key"
         key_file.write_text(PROOF_SEED.hex(), encoding="ascii")
         key_file.chmod(0o600)
@@ -231,6 +242,121 @@ class ScreenHistoryAssociationTest(unittest.IsolatedAsyncioTestCase):
         }
         fields.update(adjustment)
         return receipt_signed(fields, self.issuer_secret)
+
+    def signed_intent(self, generation, **adjustment):
+        fields = self.receipt(generation)
+        fields.pop("signature")
+        fields["expiresAt"] = int(time.time()) + 120
+        fields.update(adjustment)
+        message = wire_message(
+            b"screen-history-start-intent-v1\0", list(fields.values())
+        )
+        signature = libnacl.crypto_sign(message, self.dispatch_secret)[:64]
+        return {**fields, "signature": b64url(signature)}
+
+    def enable_dispatch(self):
+        self.section["history screen_association"]["dispatch_public_key"] = (
+            self.dispatch_public.hex()
+        )
+
+    @asynccontextmanager
+    async def capture_klippy_start(self, moon, **mock_options):
+        with (
+            patch.object(moon.klippy, "is_connected", return_value=True),
+            patch.object(moon.klippy, "_request_standard", **mock_options) as dispatch,
+        ):
+            try:
+                yield dispatch
+            finally:
+                await moon.server.drain_events()
+
+    async def test_signed_start_reaches_same_klippy_start_transport(self):
+        self.enable_dispatch()
+        async with self.instance() as moon:
+            generation = await moon.generation()
+            intent = self.signed_intent(generation, filename="目录/切片.gcode")
+            async with self.capture_klippy_start(moon, return_value="ok") as dispatch:
+                self.assertEqual(
+                    await moon.server.request(
+                        START, RequestType.POST, **{SCREEN_START_INTENT: intent}
+                    ), "ok"
+                )
+                request = dispatch.await_args.args[0]
+                self.assertEqual(request.get_endpoint(), "gcode/script")
+                self.assertEqual(request.get_args(), {SCREEN_START_INTENT: intent})
+                self.assertEqual(await moon.rows(), [])
+
+                receipt = self.receipt(generation, filename=intent["filename"])
+                await moon.status(
+                    "printing", filename=intent["filename"], **{RECEIPT_KEY: receipt}
+                )
+                (row,) = await moon.rows()
+                proof = await moon.proof(generation, row)
+                self.assertEqual(proof["startId"], intent["startId"])
+                self.assert_proof_signature(proof)
+
+    async def test_invalid_signed_start_and_raw_metadata_are_never_forwarded(self):
+        self.enable_dispatch()
+        async with self.instance() as moon:
+            generation = await moon.generation()
+            intent = self.signed_intent(generation)
+            now = int(time.time())
+            requests = [
+                {SCREEN_START_INTENT: intent, "filename": FILENAME},
+                {SCREEN_START_INTENT: None},
+                {SCREEN_START_INTENT: self.receipt(generation)},
+                {SCREEN_START_INTENT: {**intent, "taskId": "confused"}},
+                {SCREEN_START_INTENT: self.signed_intent(generation, expiresAt=now)},
+                {SCREEN_START_INTENT: self.signed_intent(generation, expiresAt=True)},
+                {SCREEN_START_INTENT: self.signed_intent(generation, expiresAt=now + 400)},
+                {SCREEN_START_INTENT: self.signed_intent(generation, filename="../test")},
+                {SCREEN_START_INTENT: self.signed_intent(str(uuid.uuid4()))},
+                {SCREEN_START_INTENT: self.signed_intent(generation, authorityKeyId="a" * 64)},
+            ]
+            async with self.capture_klippy_start(moon, return_value="ok") as dispatch:
+                for request in requests:
+                    with self.subTest(request=request), self.assertRaises(ServerError):
+                        await moon.server.request(START, RequestType.POST, **request)
+                with self.assertRaises(ServerError):
+                    await moon.klippy.request(WebRequest(
+                        "gcode/script", {SCREEN_START_INTENT: intent}
+                    ))
+                dispatch.assert_not_awaited()
+
+    async def test_unsigned_legacy_start_works_with_dispatch_disabled(self):
+        async with self.instance() as moon:
+            intent = self.signed_intent(await moon.generation())
+            async with self.capture_klippy_start(moon, return_value="ok") as dispatch:
+                with self.assertRaises(ServerError):
+                    await moon.server.request(
+                        START, RequestType.POST, **{SCREEN_START_INTENT: intent}
+                    )
+                dispatch.assert_not_awaited()
+                self.assertEqual(
+                    await moon.server.request(START, RequestType.POST, filename=FILENAME),
+                    "ok"
+                )
+                dispatch.assert_awaited_once()
+                self.assertEqual(dispatch.await_args.args[0].get_args(), {
+                    "script": f'SDCARD_PRINT_FILE FILENAME="{FILENAME}"'
+                })
+
+    async def test_unavailable_klippy_never_falls_back_to_legacy_start(self):
+        self.enable_dispatch()
+        async with self.instance() as moon:
+            intent = self.signed_intent(await moon.generation())
+            # Stock Klippy requires the script argument in gcode/script.
+            async with self.capture_klippy_start(
+                moon, side_effect=ServerError("No value for 'script'", 400)
+            ) as dispatch:
+                with self.assertRaises(ServerError):
+                    await moon.server.request(
+                        START, RequestType.POST, **{SCREEN_START_INTENT: intent}
+                    )
+                dispatch.assert_awaited_once()
+                self.assertEqual(
+                    dispatch.await_args.args[0].get_args(), {SCREEN_START_INTENT: intent}
+                )
 
     def assert_unbound(self, job):
         self.assertNotIn("rowId", job)

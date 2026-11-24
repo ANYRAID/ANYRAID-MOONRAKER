@@ -12,6 +12,7 @@ import pathlib
 import re
 import sqlite3
 import stat
+import time
 from typing import TYPE_CHECKING, Any
 
 from ..common import RequestType, SqlTableDefinition
@@ -37,6 +38,8 @@ _RECEIPT_FIELDS = (
     "origin", "databaseGeneration", "backendEpoch", "taskId", "startId",
     "authorityKeyId", "filename", "fileSha256"
 )
+_INTENT_FIELDS = (*_RECEIPT_FIELDS, "expiresAt")
+_MAX_INTENT_LIFETIME = 300
 _PROOF_FIELDS = (
     "origin", "jobId", "challenge", "databaseGeneration", "rowId"
 )
@@ -81,6 +84,21 @@ def _base64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
+def _verify_signature(
+    verifier: Any, domain: bytes, fields: tuple[str, ...], value: dict[str, Any]
+) -> bool:
+    if not _matches(_SIGNATURE, value["signature"]):
+        return False
+    signature = base64.urlsafe_b64decode(value["signature"] + "==")
+    if _base64url(signature) != value["signature"]:
+        return False
+    try:
+        verifier.verify(signature + _message(domain, fields, value))
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
 def _read_signing_seed(path: pathlib.Path) -> bytes:
     if not path.is_absolute():
         raise ValueError("Expected an absolute key path")
@@ -115,16 +133,24 @@ class HistoryAssociation:
         if not 1 <= port <= 65535 or port == 80:
             raise self.server.error("Invalid screen history association origin")
         issuer_key: str = config.get("issuer_public_key")
+        dispatch_key: str | None = config.get("dispatch_public_key", None)
         signing_key = pathlib.Path(config.get("signing_key_path")).expanduser()
         try:
             if not _matches(_HEX32, issuer_key):
                 raise ValueError("Invalid issuer key")
             self.issuer = Verifier(issuer_key.encode("ascii"))
             self.signer = Signer(_read_signing_seed(signing_key))
+            self.dispatch_verifier = None
+            if dispatch_key is not None:
+                if not _matches(_HEX32, dispatch_key):
+                    raise ValueError("Invalid dispatch key")
+                self.dispatch_verifier = Verifier(dispatch_key.encode("ascii"))
         except (OSError, ValueError, AttributeError):
             raise self.server.error("Invalid screen history association keys") from None
         if self.signer.vk.hex() == issuer_key:
             raise self.server.error("Screen history issuer and proof keys must differ")
+        if dispatch_key in (issuer_key, self.signer.vk.hex()):
+            raise self.server.error("Screen print dispatch requires a separate key")
         self.issuer_key_id = hashlib.sha256(bytes.fromhex(issuer_key)).hexdigest()
         self.authority_key_id = hashlib.sha256(
             _SPKI_ED25519_PREFIX + self.signer.vk
@@ -136,39 +162,58 @@ class HistoryAssociation:
             self._handle_request
         )
 
+    def _matches_start_fields(self, fields: dict[str, Any]) -> bool:
+        filename = fields["filename"]
+        return (
+            fields["origin"] == self.origin
+            and fields["authorityKeyId"] == self.authority_key_id
+            and isinstance(filename, str) and 1 <= len(filename) <= 4096
+            and all(part not in ("", ".", "..") for part in filename.split("/"))
+            and "\\" not in filename
+            and all(ord(char) >= 32 and ord(char) != 127 for char in filename)
+            and _matches(_HEX32, fields["fileSha256"])
+            and _matches(_UUID4, fields["databaseGeneration"])
+            and _matches(_UUID4, fields["startId"])
+            and _matches(_IDENTIFIER, fields["backendEpoch"])
+            and _matches(_IDENTIFIER, fields["taskId"])
+        )
+
     def verify_receipt(self, receipt: Any, filename: str) -> dict[str, str] | None:
         if (
-            not isinstance(receipt, dict)
-            or receipt.keys() != {*_RECEIPT_FIELDS, "signature"}
-        ):
-            return None
-        if (
-            receipt["origin"] != self.origin
-            or receipt["authorityKeyId"] != self.authority_key_id
-            or receipt["filename"] != filename
-            or not isinstance(filename, str) or not 1 <= len(filename) <= 4096
-            or any(part in ("", ".", "..") for part in filename.split("/"))
-            or "\\" in filename
-            or any(ord(char) < 32 or ord(char) == 127 for char in filename)
-            or not _matches(_HEX32, receipt["fileSha256"])
-            or not _matches(_UUID4, receipt["databaseGeneration"])
-            or not _matches(_UUID4, receipt["startId"])
-            or not _matches(_IDENTIFIER, receipt["backendEpoch"])
-            or not _matches(_IDENTIFIER, receipt["taskId"])
-            or not _matches(_SIGNATURE, receipt["signature"])
-        ):
-            return None
-        signature = base64.urlsafe_b64decode(receipt["signature"] + "==")
-        if _base64url(signature) != receipt["signature"]:
-            return None
-        try:
-            message = _message(
-                b"screen-history-start-receipt-v1\0", _RECEIPT_FIELDS, receipt
+            isinstance(receipt, dict)
+            and receipt.keys() == {*_RECEIPT_FIELDS, "signature"}
+            and receipt["filename"] == filename
+            and self._matches_start_fields(receipt)
+            and _verify_signature(
+                self.issuer, b"screen-history-start-receipt-v1\0", _RECEIPT_FIELDS,
+                receipt
             )
-            self.issuer.verify(signature + message)
-        except (ValueError, TypeError):
-            return None
-        return dict(receipt)
+        ):
+            return dict(receipt)
+        return None
+
+    async def authenticate_dispatch(self, intent: Any) -> dict[str, Any]:
+        if self.dispatch_verifier is None:
+            raise self.server.error("Screen print dispatch unavailable", 503)
+        now = int(time.time())
+        if (
+            not isinstance(intent, dict)
+            or intent.keys() != {*_INTENT_FIELDS, "signature"}
+            or not self._matches_start_fields(intent)
+            or type(intent["expiresAt"]) is not int
+            or not now < intent["expiresAt"] <= now + _MAX_INTENT_LIFETIME
+            or not _verify_signature(
+                self.dispatch_verifier, b"screen-history-start-intent-v1\0",
+                _INTENT_FIELDS, intent
+            )
+        ):
+            raise self.server.error("Invalid screen print intent", 403)
+        generation = await self.database.queue_sql_callback(
+            self.database.require_history_generation
+        )
+        if intent["databaseGeneration"] != generation:
+            raise self.server.error("Screen print history generation changed", 409)
+        return dict(intent)
 
     def record_binding(
         self, conn: sqlite3.Connection, row_id: str, job_id: int,
