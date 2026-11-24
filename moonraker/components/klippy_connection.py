@@ -15,6 +15,7 @@ import pathlib
 from ..utils import ServerError, get_unix_peer_credentials
 from ..utils import json_wrapper as jsonw
 from ..common import KlippyState, RequestType
+from .history_association import RECEIPT_FIELD
 
 # Annotation imports
 from typing import (
@@ -654,6 +655,10 @@ class KlippyConnection:
                 if obj in self.subscription_cache:
                     cached_status = self.subscription_cache[obj]
                     for field_name, value in fields.items():
+                        if obj == "print_stats" and field_name == RECEIPT_FIELD:
+                            # A snapshot returned by a subscription request is
+                            # not evidence from a fresh Klippy notification.
+                            continue
                         if field_name not in cached_status:
                             continue
                         if value != cached_status[field_name]:

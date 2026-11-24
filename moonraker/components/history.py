@@ -7,13 +7,21 @@
 from __future__ import annotations
 import time
 import logging
-from asyncio import Lock
+import sqlite3
+import uuid
+from asyncio import Lock, sleep
 from ..common import (
     JobEvent,
     RequestType,
     HistoryFieldData,
     FieldTracker,
     SqlTableDefinition
+)
+from .history_association import (
+    CONFIG_SECTION,
+    HISTORY_ROW_ID,
+    RECEIPT_FIELD,
+    HistoryAssociation
 )
 
 # Annotation imports
@@ -133,11 +141,12 @@ class HistorySqlDefinition(SqlTableDefinition):
             filament_used REAL NOT NULL,
             metadata pyjson,
             auxiliary_data pyjson NOT NULL,
-            instance_id TEXT NOT NULL
+            instance_id TEXT NOT NULL,
+            {HISTORY_ROW_ID} TEXT
         )
         """
     )
-    version = 1
+    version = 2
 
     def _get_entry_item(
         self, entry: Dict[str, Any], name: str, default: Any = 0.
@@ -148,8 +157,14 @@ class HistorySqlDefinition(SqlTableDefinition):
         return val
 
     def migrate(self, last_version: int, db_provider: DBProviderWrapper) -> None:
+        conn = db_provider.connection
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({HIST_TABLE})")}
+        if HISTORY_ROW_ID not in columns:
+            with conn:
+                conn.execute(
+                    f"ALTER TABLE {HIST_TABLE} ADD COLUMN {HISTORY_ROW_ID} TEXT"
+                )
         if last_version == 0:
-            conn = db_provider.connection
             for batch in db_provider.iter_namespace("history", 1000):
                 conv_vals: List[Tuple[Any, ...]] = []
                 entry: Dict[str, Any]
@@ -173,7 +188,8 @@ class HistorySqlDefinition(SqlTableDefinition):
                                 self._get_entry_item(entry, "filament_used"),
                                 self._get_entry_item(entry, "metadata", {}),
                                 self._get_entry_item(entry, "auxiliary_data", []),
-                                "default"
+                                "default",
+                                None
                             )
                         )
                     except KeyError:
@@ -193,11 +209,17 @@ class History:
         self.server = config.get_server()
         self.file_manager: FileManager = self.server.lookup_component('file_manager')
         self.request_lock = Lock()
+        self.job_state_lock = Lock()
         FieldTracker.class_init(self)
         self.auxiliary_fields: List[HistoryFieldData] = []
         database: DBComp = self.server.lookup_component("database")
         self.history_table = database.register_table(HistorySqlDefinition())
         self.totals_table = database.register_table(TotalsSqlDefinition())
+        self.association: HistoryAssociation | None = None
+        if config.has_section(CONFIG_SECTION):
+            self.association = HistoryAssociation(
+                config.getsection(CONFIG_SECTION), database, HIST_TABLE
+            )
         self.job_totals: Totals = dict(BASE_TOTALS)
         self.aux_totals: AuxTotals = []
 
@@ -228,6 +250,7 @@ class History:
 
         self.current_job: Optional[PrinterJob] = None
         self.current_job_id: Optional[int] = None
+        self.current_history_row_id: Optional[str] = None
         self.job_user: str = "No User"
         self.job_paused: bool = False
 
@@ -271,14 +294,12 @@ class History:
             req_type = web_request.get_request_type()
             if req_type == RequestType.GET:
                 job_id = web_request.get_str("uid")
-                cursor = await self.history_table.execute(
-                    f"SELECT * FROM {HIST_TABLE} WHERE job_id = ?", (int(job_id, 16),)
+                rows = await self._read_jobs(
+                    f"SELECT * FROM {HIST_TABLE} WHERE job_id = ?", [int(job_id, 16)]
                 )
-                result = await cursor.fetchone()
-                if result is None:
+                if not rows:
                     raise self.server.error(f"Invalid job uid: {job_id}", 404)
-                job = dict(result)
-                return {"job": self._prep_requested_job(job, job_id)}
+                return {"job": self._prep_requested_job(rows[0], job_id)}
             if req_type == RequestType.DELETE:
                 all = web_request.get_boolean("all", False)
                 if all:
@@ -331,14 +352,21 @@ class History:
                 sql_statement += " LIMIT ? OFFSET ?"
                 values.append(limit)
                 values.append(start)
-            cursor = await self.history_table.execute(sql_statement, values)
-            await cursor.set_arraysize(1000)
             jobs: List[Dict[str, Any]] = []
-            for row in await cursor.fetchall():
-                job = dict(row)
+            for row in await self._read_jobs(sql_statement, values):
                 job_id = f"{row['job_id']:06X}"
-                jobs.append(self._prep_requested_job(job, job_id))
+                jobs.append(self._prep_requested_job(row, job_id))
             return {"count": len(jobs), "jobs": jobs}
+
+    async def _read_jobs(self, sql: str, args: list[Any]) -> list[dict[str, Any]]:
+        association = self.association
+        if association is None:
+            cursor = await self.history_table.execute(sql, args)
+            return [dict(row) for row in await cursor.fetchall()]
+        read_bound_jobs = association.read_jobs
+        return await self.history_table.queue_callback(
+            lambda conn: read_bound_jobs(conn, sql, args)
+        )
 
     async def _handle_job_totals(
         self, web_request: WebRequest
@@ -376,20 +404,25 @@ class History:
         prev_stats: Dict[str, Any],
         new_stats: Dict[str, Any]
     ) -> None:
-        self.job_paused = job_event == JobEvent.PAUSED
-        if job_event == JobEvent.STARTED:
-            if self.current_job is not None:
-                # Finish with the previous state
+        async with self.job_state_lock:
+            self.job_paused = job_event == JobEvent.PAUSED
+            if job_event == JobEvent.STARTED:
+                if self.current_job is not None:
+                    # Finish with the previous state
+                    await self.finish_job("cancelled", prev_stats)
+                receipt = (
+                    new_stats.get(RECEIPT_FIELD)
+                    if new_stats.get("state") == "printing" else None
+                )
+                await self.add_job(PrinterJob(new_stats), receipt)
+            elif job_event == JobEvent.COMPLETE:
+                await self.finish_job("completed", new_stats)
+            elif job_event == JobEvent.ERROR:
+                await self.finish_job("error", new_stats)
+            elif job_event in (JobEvent.CANCELLED, JobEvent.STANDBY):
+                # Cancel on "standby" for backward compatibility with
+                # `CLEAR_PAUSE/SDCARD_RESET_FILE` workflow
                 await self.finish_job("cancelled", prev_stats)
-            await self.add_job(PrinterJob(new_stats))
-        elif job_event == JobEvent.COMPLETE:
-            await self.finish_job("completed", new_stats)
-        elif job_event == JobEvent.ERROR:
-            await self.finish_job("error", new_stats)
-        elif job_event in (JobEvent.CANCELLED, JobEvent.STANDBY):
-            # Cancel on "standby" for backward compatibility with
-            # `CLEAR_PAUSE/SDCARD_RESET_FILE` workflow
-            await self.finish_job("cancelled", prev_stats)
 
     def _on_job_requested(self, user: Optional[UserInfo]) -> None:
         username = user.username if user is not None else "No User"
@@ -398,25 +431,37 @@ class History:
             self.current_job.user = username
 
     async def _handle_shutdown(self) -> None:
-        jstate: JobState = self.server.lookup_component("job_state")
-        last_ps = jstate.get_last_stats()
-        await self.finish_job("klippy_shutdown", last_ps)
+        await self._finish_from_last_stats("klippy_shutdown")
 
     async def _handle_disconnect(self) -> None:
-        jstate: JobState = self.server.lookup_component("job_state")
-        last_ps = jstate.get_last_stats()
-        await self.finish_job("klippy_disconnect", last_ps)
+        await self._finish_from_last_stats("klippy_disconnect")
 
-    async def add_job(self, job: PrinterJob) -> None:
+    async def _finish_from_last_stats(self, status: str) -> None:
+        async with self.job_state_lock:
+            jstate: JobState = self.server.lookup_component("job_state")
+            await self.finish_job(status, jstate.get_last_stats())
+
+    async def add_job(self, job: PrinterJob, raw_receipt: Any = None) -> None:
         async with self.request_lock:
             self.current_job = job
             self.current_job_id = None
+            self.current_history_row_id = str(uuid.uuid4())
             self.current_job.user = self.job_user
             self.grab_job_metadata()
             for field in self.auxiliary_fields:
                 field.tracker.reset()
             self.current_job.set_aux_data(self.auxiliary_fields)
-            new_id = await self.save_job(job, None)
+            receipt = (
+                self.association.verify_receipt(raw_receipt, job.filename)
+                if self.association is not None else None
+            )
+            try:
+                new_id = await self.save_job(
+                    job, None, self.current_history_row_id, receipt
+                )
+            except Exception:
+                self._reset_current_job()
+                raise
             if new_id is None:
                 logging.info(f"Error saving job, filename '{job.filename}'")
                 return
@@ -428,9 +473,11 @@ class History:
             )
             self.send_history_event("added")
 
-    async def save_job(self, job: PrinterJob, job_id: Optional[int]) -> Optional[int]:
+    async def save_job(
+        self, job: PrinterJob, job_id: Optional[int], row_id: str,
+        receipt: dict[str, str] | None = None
+    ) -> Optional[int]:
         values: List[Any] = [
-            job_id,
             job.user,
             job.filename,
             job.status,
@@ -443,24 +490,58 @@ class History:
             job.auxiliary_data,
             "default"
         ]
-        placeholders = ",".join("?" * len(values))
-        async with self.history_table as tx:
-            cursor = await tx.execute(
-                f"REPLACE INTO {HIST_TABLE} VALUES({placeholders})", values
-            )
-        return cursor.lastrowid
+        association = self.association
+
+        def _save(conn: sqlite3.Connection) -> tuple[bool, Optional[int]]:
+            # The provider executes both writes together on its SQLite thread.
+            # Another component may have queued its SQL but not its commit yet.
+            if conn.in_transaction:
+                return False, None
+            conn.execute("BEGIN IMMEDIATE")
+            with conn:
+                if job_id is not None:
+                    cursor = conn.execute(
+                        f"UPDATE {HIST_TABLE} SET user=?, filename=?, status=?, "
+                        "start_time=?, end_time=?, print_duration=?, total_duration=?, "
+                        "filament_used=?, metadata=?, auxiliary_data=?, instance_id=? "
+                        f"WHERE job_id=? AND {HISTORY_ROW_ID}=?",
+                        [*values, job_id, row_id]
+                    )
+                    return True, job_id if cursor.rowcount else None
+                placeholders = ",".join("?" * (len(values) + 2))
+                cursor = conn.execute(
+                    f"INSERT INTO {HIST_TABLE} VALUES ({placeholders})",
+                    [None, *values, row_id]
+                )
+                new_id = cursor.lastrowid
+                if cursor.rowcount != 1 or new_id is None:
+                    raise self.server.error("Unable to insert job history", 500)
+                if receipt is not None and association is not None:
+                    association.record_binding(conn, row_id, new_id, receipt)
+                return True, new_id
+
+        for delay in (0, 0.01, 0.05, 0.1):
+            if delay:
+                await sleep(delay)
+            saved, saved_id = await self.history_table.queue_callback(_save)
+            if saved:
+                return saved_id
+        raise self.server.error("Job history database is busy", 503)
 
     async def delete_job(self, job_id: Union[int, str]) -> None:
         if isinstance(job_id, str):
             job_id = int(job_id, 16)
         async with self.history_table as tx:
-            tx.execute(
+            await tx.execute(
                 f"DELETE FROM {HIST_TABLE} WHERE job_id = ?", (job_id,)
             )
 
     async def finish_job(self, status: str, pstats: Dict[str, Any]) -> None:
         async with self.request_lock:
-            if self.current_job is None or self.current_job_id is None:
+            if (
+                self.current_job is None or self.current_job_id is None
+                or self.current_history_row_id is None
+            ):
                 self._reset_current_job()
                 return
             if (
@@ -475,20 +556,24 @@ class History:
             self.grab_job_metadata()
             self.current_job.set_aux_data(self.auxiliary_fields)
             job_id = f"{self.current_job_id:06X}"
-            await self.save_job(self.current_job, self.current_job_id)
-            self.update_metadata(job_id)
-            await self._update_job_totals()
-            logging.debug(
-                f"History Job Finished - Id: {job_id}, "
-                f"File: {self.current_job.filename}, "
-                f"Status: {status}"
+            saved_id = await self.save_job(
+                self.current_job, self.current_job_id, self.current_history_row_id
             )
-            self.send_history_event("finished")
+            await self._update_job_totals()
+            if saved_id is not None:
+                self.update_metadata(job_id)
+                logging.debug(
+                    f"History Job Finished - Id: {job_id}, "
+                    f"File: {self.current_job.filename}, "
+                    f"Status: {status}"
+                )
+                self.send_history_event("finished")
             self._reset_current_job()
 
     def _reset_current_job(self) -> None:
         self.current_job = None
         self.current_job_id = None
+        self.current_history_row_id = None
         self.job_user = "No User"
 
     async def get_job(
@@ -581,6 +666,7 @@ class History:
         job["exists"] = fm.check_file_exists("gcodes", job['filename'], mtime)
         job["job_id"] = job_id
         job.pop("instance_id", None)
+        job.pop(HISTORY_ROW_ID, None)
         return job
 
     def register_auxiliary_field(self, new_field: HistoryFieldData) -> None:
@@ -600,11 +686,8 @@ class History:
         return not self.job_paused if check_paused else True
 
     async def on_exit(self) -> None:
-        if self.current_job is None:
-            return
-        jstate: JobState = self.server.lookup_component("job_state")
-        last_ps = jstate.get_last_stats()
-        await self.finish_job("server_exit", last_ps)
+        if self.current_job is not None:
+            await self._finish_from_last_stats("server_exit")
 
 class PrinterJob:
     def __init__(self, data: Dict[str, Any] = {}) -> None:
