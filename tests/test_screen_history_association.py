@@ -526,6 +526,51 @@ class ScreenHistoryAssociationTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ServerError):
                 await moon.proof(generation, bound)
 
+    async def test_first_enable_rejects_provider_connection_to_replaced_database(self):
+        source = DictSourceWrapper()
+        source.read_dict({"server": {}})
+        server = OfflineServer(self.directory)
+        config = ConfigHelper(server, source, "server", {})
+        old_path = self.directory / "old.sqlite"
+        replacement = self.directory / "replacement.sqlite"
+        connect = sqlite3.connect
+        with closing(connect(replacement)) as conn, conn:
+            conn.execute("CREATE TABLE replacement_marker (value TEXT)")
+
+        def connect_before_path_swap(path, *args, **kwargs):
+            # Model replacement after sqlite3.connect opens its file but before
+            # the provider can observe the main pathname. The old connection
+            # uses a retained pathname so SQLite can still commit to its inode.
+            old_conn = connect(old_path, *args, **kwargs)
+            try:
+                os.link(old_path, path)
+                replacement.replace(path)
+            except OSError:
+                old_conn.close()
+                raise
+            return old_conn
+
+        with patch.object(sqlite3, "connect", connect_before_path_swap):
+            database = MoonrakerDatabase(config)
+        try:
+            self.assertFalse(database.database_path.samefile(old_path))
+            database.enable_history_generation()
+            with self.assertRaises(ServerError) as unavailable:
+                await database.queue_sql_callback(database.require_history_generation)
+            self.assertEqual(unavailable.exception.status_code, 503)
+            marker_sql = (
+                "SELECT name FROM sqlite_master "
+                "WHERE name = 'anyraid_history_database_generation'"
+            )
+            self.assertIsNotNone(database.db_provider.sync_conn.execute(
+                marker_sql
+            ).fetchone())
+            with closing(connect(database.database_path)) as current:
+                self.assertIsNone(current.execute(marker_sql).fetchone())
+        finally:
+            await database.close()
+            database.db_provider.sync_conn.close()
+
     async def test_missing_or_replaced_pin_disables_association_after_reopen(self):
         for case in ("missing-pin", "replaced-pin"):
             with self.subTest(case=case):

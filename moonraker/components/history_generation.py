@@ -87,6 +87,14 @@ class HistoryDatabaseGeneration:
                     f"INSERT OR REPLACE INTO {_MARKER_TABLE} VALUES (1, ?)",
                     (generation,)
                 )
+            # Check the committed marker through the main pathname as well as
+            # the provider connection, which might have been opened before a swap.
+            uri = f"{self.db_path.as_uri()}?mode=ro"
+            with contextlib.closing(sqlite3.connect(uri, uri=True)) as live_conn:
+                if self._read_marker(live_conn) != generation:
+                    raise GenerationUnavailable(
+                        "History database changed while opening"
+                    )
             if self._pin_identity() != identity or self._file_identity() != identity:
                 raise GenerationUnavailable("History database changed while opening")
             with anchor:
